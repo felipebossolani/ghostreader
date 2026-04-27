@@ -17,5 +17,8 @@ packages/processor/public/
 packages/scraper/userdata/
 packages/scraper/probe-reports/
 
+# Scraped data outputs
+debentures.json
+
 # OS
 .DS_Store
