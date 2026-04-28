@@ -397,13 +397,52 @@ def _log_config(config):
 
 async def render_page(url, wait_after_load=2.0, timeout=15000, headers=None,
                        wait_for_selector=None, wait_until="domcontentloaded",
-                       wait_for_function=None):
-    """Render a page in the browser and return (html, status_code, final_url).
+                       wait_for_function=None, collect_xhrs=None):
+    """Render a page in the browser and return (html, status_code, final_url, xhrs).
 
     This is the shared rendering logic used by both /scrape and /extract.
+
+    `collect_xhrs` is a list of substring patterns; any XHR/fetch response
+    whose URL contains one of them is captured (status, url, body parsed as
+    JSON if Content-Type allows). Returned as the 4th tuple element.
+    Use this to harvest the API responses that an SPA fires during a page
+    load — much cheaper than scraping the rendered HTML afterwards.
     """
     browser = await get_browser()
     page = await browser.new_page()
+
+    captured_xhrs = []
+    pending_capture_tasks = []
+
+    if collect_xhrs:
+        async def _capture_xhr(resp):
+            try:
+                req = resp.request
+                if req.resource_type not in ('xhr', 'fetch'):
+                    return
+                if not any(p in resp.url for p in collect_xhrs):
+                    return
+                ctype = (resp.headers or {}).get('content-type', '')
+                body = None
+                if 'json' in ctype.lower():
+                    try:
+                        raw = await resp.body()
+                        body = json.loads(raw.decode('utf-8'))
+                    except Exception as e:
+                        body = {'__parse_error__': str(e)}
+                captured_xhrs.append({
+                    'method': req.method,
+                    'status': resp.status,
+                    'url': resp.url,
+                    'body': body,
+                })
+            except Exception as e:
+                logger.warning('xhr capture error: %s', e)
+
+        def _spawn(r):
+            pending_capture_tasks.append(asyncio.create_task(_capture_xhr(r)))
+
+        page.on('response', _spawn)
 
     try:
         if headers:
@@ -446,7 +485,18 @@ async def render_page(url, wait_after_load=2.0, timeout=15000, headers=None,
         status_code = response.status if response else 0
         final_url = page.url
 
-        return page_html, status_code, final_url
+        # Drain any in-flight XHR-capture tasks before closing the page
+        # (page.close() cancels pending response.body() reads).
+        if pending_capture_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_capture_tasks, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("xhr drain timed out with %d tasks", len(pending_capture_tasks))
+
+        return page_html, status_code, final_url, captured_xhrs
 
     finally:
         await page.close()
@@ -473,7 +523,7 @@ async def handle_scrape(request: web.Request) -> web.Response:
     logger.info("Scraping: %s", url)
 
     try:
-        page_html, status_code, final_url = await render_page(
+        page_html, status_code, final_url, xhrs = await render_page(
             url=url,
             wait_after_load=body.get("wait_after_load", 2),
             timeout=body.get("timeout", 15000),
@@ -481,15 +531,19 @@ async def handle_scrape(request: web.Request) -> web.Response:
             wait_for_selector=body.get("wait_for_selector"),
             wait_until=body.get("wait_until", "domcontentloaded"),
             wait_for_function=body.get("wait_for_function"),
+            collect_xhrs=body.get("collect_xhrs"),
         )
 
-        logger.info("Scraped %s -> %d (%d bytes)", url, status_code, len(page_html))
+        logger.info("Scraped %s -> %d (%d bytes, %d xhrs)", url, status_code, len(page_html), len(xhrs))
 
-        return web.json_response({
+        resp_body = {
             "html": page_html,
             "status": status_code,
             "url": final_url,
-        })
+        }
+        if body.get("collect_xhrs"):
+            resp_body["xhrs"] = xhrs
+        return web.json_response(resp_body)
 
     except Exception as e:
         logger.error("Error scraping %s: %s", url, e)
@@ -536,7 +590,7 @@ async def handle_render(request: web.Request) -> web.Response:
     logger.info("Render: %s (wait=%.1f)", target_url, wait_after_load)
 
     try:
-        page_html, status_code, final_url = await render_page(
+        page_html, status_code, final_url, _ = await render_page(
             url=target_url,
             wait_after_load=wait_after_load,
         )

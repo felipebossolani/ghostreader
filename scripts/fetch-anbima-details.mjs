@@ -1,28 +1,29 @@
 #!/usr/bin/env node
 /**
- * Bulk fetcher for ANBIMA Data per-debenture pages (caracteristicas + precos +
- * agenda). Reads tickers from a debentures.json (the listing output produced
- * by fetch-anbima-debentures.mjs), iterates one ticker at a time, and writes
- * a consolidated JSON with one record per ticker.
+ * Bulk fetcher for ANBIMA Data per-debenture pages.
+ *
+ * This is the JSON path: instead of scraping the rendered HTML and parsing
+ * with cheerio, we navigate the SPA in Camoufox and intercept the XHR/fetch
+ * responses the SPA itself consumes from the data-api.prd.anbima.com.br
+ * /web-bff/v1/debentures/* endpoints. The captured JSON is structured,
+ * carries ISO dates and typed numbers, and is what feeds the rendered UI
+ * — so it is by definition the canonical view.
  *
  * Usage:
  *   node scripts/fetch-anbima-details.mjs [options]
  *
  * Options:
- *   --input <path>        Listing JSON with {url,title,...} entries (default: debentures.json)
+ *   --input <path>        Listing JSON (default: debentures.json)
  *   --output <path>       Output file (default: details.json)
  *   --historico <window>  D-30 (default) | M-1 | D-N | full
- *   --base-url <url>      GhostReader processor (default: http://localhost:3000)
- *   --delay <ms>          Sleep between tickers (default: 1000)
- *   --retry <n>           Retries per failed call w/ exponential backoff (default: 3)
- *   --timeout <ms>        Per-call timeout (default: 90000)
+ *   --scraper-url <url>   Scraper service (default: http://localhost:8090)
+ *   --delay <ms>          Sleep between tickers (default: 200)
+ *   --retry <n>           Retries per failed scrape (default: 5)
+ *   --timeout <ms>        Per-call timeout (default: 30000)
  *   --resume              Skip tickers already present in output
  *   --limit <n>           Process only first N tickers
- *   --start <n>           Skip the first N tickers (useful for resuming a slice)
- *   --quiet               Suppress per-call lines, keep only ticker summary
- *
- * Environment:
- *   GHOSTREADER_URL       Overrides --base-url
+ *   --start <n>           Skip the first N tickers
+ *   --quiet               Suppress per-ticker line, keep only summary
  *
  * Examples:
  *   node scripts/fetch-anbima-details.mjs --historico D-30 --limit 50
@@ -56,34 +57,31 @@ const flags = parseArgs(process.argv.slice(2));
 const INPUT   = flags.input   || 'debentures.json';
 const OUTPUT  = flags.output  || 'details.json';
 const HIST    = flags.historico || 'D-30';
-const BASE    = (process.env.GHOSTREADER_URL || flags['base-url'] || 'http://localhost:3000').replace(/\/$/, '');
-const DELAY   = parseInt(flags.delay   || '1000', 10);
-const RETRY   = parseInt(flags.retry   || '3', 10);
-const TIMEOUT = parseInt(flags.timeout || '90000', 10);
+const SCRAPER = (process.env.SCRAPER_URL || flags['scraper-url'] || 'http://localhost:8090').replace(/\/$/, '');
+const DELAY   = parseInt(flags.delay   || '200', 10);
+const RETRY   = parseInt(flags.retry   || '5', 10);
+const TIMEOUT = parseInt(flags.timeout || '30000', 10);
 const RESUME  = flags.resume === 'true';
 const LIMIT   = flags.limit ? parseInt(flags.limit, 10) : Infinity;
 const START   = flags.start ? parseInt(flags.start, 10) : 0;
 const QUIET   = flags.quiet === 'true';
-const SIZE    = 100; // ANBIMA accepts up to 100 per page
+const SIZE    = 100;
 
 // ---------------------------------------------------------------------------
-// History window parsing
+// History window predicate (operates on JS Date — XHR data is ISO)
 // ---------------------------------------------------------------------------
-/** Returns a predicate (rowDate => boolean) for the configured --historico. */
 function buildHistFilter(spec) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  if (spec === 'full') return null; // no filter; paginate everything
+  if (spec === 'full') return null;
 
   if (spec === 'M-1') {
-    // previous calendar month relative to today
     const start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
     const end   = new Date(today.getFullYear(), today.getMonth(), 0, 23, 59, 59);
     return (d) => d >= start && d <= end;
   }
 
-  // D-N (e.g. D-30, D-7)
   const m = /^D-(\d+)$/.exec(spec);
   if (!m) {
     throw new Error(`Invalid --historico value: ${spec}. Expected D-N, M-1, or full.`);
@@ -93,13 +91,6 @@ function buildHistFilter(spec) {
   return (d) => d >= start && d <= today;
 }
 
-/** Parse "dd/mm/yyyy" to a Date (midnight local). */
-function parseBrDate(s) {
-  const [d, m, y] = s.split('/').map((n) => parseInt(n, 10));
-  if (!d || !m || !y) return null;
-  return new Date(y, m - 1, d);
-}
-
 // ---------------------------------------------------------------------------
 // HTTP with retry
 // ---------------------------------------------------------------------------
@@ -107,175 +98,126 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function postExtract(url, profile, attempt = 1) {
+/**
+ * Drive the scraper to load `url` in a headless browser and capture every
+ * XHR/fetch hitting the ANBIMA data API. Returns the array of successful
+ * (status 200) responses with parsed JSON bodies.
+ */
+async function scrapeAndCollect(url, opts = {}, attempt = 1) {
+  const body = {
+    url,
+    wait_after_load: opts.waitAfterLoad ?? 1.5,
+    timeout: TIMEOUT,
+    wait_until: 'domcontentloaded',
+    collect_xhrs: ['data-api.prd.anbima.com.br/web-bff/v1/debentures/'],
+  };
+  if (opts.waitForFunction) body.wait_for_function = opts.waitForFunction;
+  if (opts.waitForSelector) body.wait_for_selector = opts.waitForSelector;
+
   try {
-    const res = await fetch(`${BASE}/extract`, {
+    const res = await fetch(`${SCRAPER}/scrape`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, profile, timeout: TIMEOUT }),
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const data = await res.json();
-    if (data.error) throw new Error(`extract error: ${String(data.error).slice(0, 200)}`);
-    return data;
+    if (data.error) throw new Error(`scrape error: ${String(data.error).slice(0, 200)}`);
+    return (data.xhrs || []).filter((x) => x.status === 200);
   } catch (err) {
     if (attempt >= RETRY) throw err;
-    const backoff = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s...
+    const backoff = 1000 * Math.pow(2, attempt - 1);
     if (!QUIET) console.error(`    retry ${attempt}/${RETRY - 1} after ${backoff}ms (${err.message.slice(0, 80)})`);
     await sleep(backoff);
-    return postExtract(url, profile, attempt + 1);
+    return scrapeAndCollect(url, opts, attempt + 1);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Per-endpoint helpers
-// ---------------------------------------------------------------------------
-async function fetchCaracteristicas(ticker) {
-  const url = `https://data.anbima.com.br/debentures/${ticker}/caracteristicas`;
-  const data = await postExtract(url, 'anbima_debenture_caracteristicas');
-  return data.results[0]?.content || {};
-}
-
-/** Build a precos URL. With `bust=true`, append a cache-bust param to
- *  force a cold navigation (used only on recovery passes; defeats the
- *  Camoufox/SPA optimisation that keeps subsequent calls fast). */
-function precosUrl(ticker, page, bust = false) {
-  const u = `https://data.anbima.com.br/debentures/${ticker}/precos?page=${page}&size=${SIZE}`;
-  return bust ? `${u}&_=${Date.now()}` : u;
-}
-
-/** Parse "Exibindo 1 - 100 de 386 resultados" → 386. Returns null on miss. */
-function parseExpectedTotal(suggestions) {
-  for (const s of suggestions || []) {
-    const m = /Exibindo\s+\d+\s*-\s*\d+\s+de\s+(\d+)\s+resultados/i.exec(s);
-    if (m) return parseInt(m[1], 10);
+/**
+ * Pick the first XHR whose URL matches the regex AND whose body is a parsed
+ * JSON object (not an error placeholder). Returns the body, or null.
+ */
+function pickXhrBody(xhrs, urlPattern) {
+  for (const x of xhrs) {
+    if (urlPattern.test(x.url) && x.body && typeof x.body === 'object' && !x.body.__parse_error__) {
+      return x.body;
+    }
   }
   return null;
 }
 
-async function fetchPrecos(ticker, histFilter) {
-  // Always pull page 1 first — covers most assets in one shot under D-30.
-  const out = { indicativo: [], historico: [], flags: [] };
-  const d1 = await postExtract(precosUrl(ticker, 1, false), 'anbima_debenture_precos');
+// ---------------------------------------------------------------------------
+// Per-endpoint helpers (operate on captured XHRs)
+// ---------------------------------------------------------------------------
 
-  for (const r of d1.results) {
-    if (r.title.endsWith('PU Indicativo')) out.indicativo = r.content;
-    if (r.title.endsWith('PU Histórico')) out.historico = r.content;
-  }
-  for (const s of d1.suggestions || []) {
-    if (!s.startsWith('Exibindo')) out.flags.push(s);
-  }
-
-  const expectedTotal = parseExpectedTotal(d1.suggestions);
-
-  // Should we paginate Histórico? Need full mode OR D-N where N exceeds first page coverage.
-  let needMore = false;
-  if (histFilter === null) {
-    // full mode: always paginate until done
-    needMore = true;
-  } else if (out.historico.length === SIZE) {
-    // partial mode: only continue if oldest row in page 1 still inside window
-    const oldest = out.historico[out.historico.length - 1]?.data_de_referencia;
-    const oldestDate = oldest ? parseBrDate(oldest) : null;
-    needMore = oldestDate && histFilter(oldestDate);
-  }
-
-  // Fetch one page's historico rows. Returns null on no-data signal.
-  const fetchPage = async (page, bust) => {
-    const d = await postExtract(precosUrl(ticker, page, bust), 'anbima_debenture_precos');
-    const hist = d.results.find((r) => r.title.endsWith('PU Histórico'))?.content || [];
-    return hist;
+/**
+ * Visit /caracteristicas — captures /v1/debentures/{T} (info geral) and
+ * /v1/debentures/{T}/caracteristicas (rich info).
+ */
+async function fetchInfoAndCaracteristicas(ticker) {
+  const xhrs = await scrapeAndCollect(
+    `https://data.anbima.com.br/debentures/${ticker}/caracteristicas`,
+    { waitAfterLoad: 1.5 },
+  );
+  const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return {
+    info: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}$`)),
+    caracteristicas: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/caracteristicas$`)),
   };
-
-  // Apply window filter to a page's rows. Returns {rows, crossedBoundary}.
-  const applyFilter = (hist) => {
-    if (histFilter === null) return { rows: hist, crossedBoundary: false };
-    const filtered = [];
-    let crossed = false;
-    for (const row of hist) {
-      const dt = parseBrDate(row.data_de_referencia);
-      if (dt && histFilter(dt)) filtered.push(row);
-      else if (dt && dt < new Date(Date.now() - 365 * 86400_000)) {
-        crossed = true;
-        break;
-      }
-    }
-    if (filtered.length < hist.length) crossed = true;
-    return { rows: filtered, crossedBoundary: crossed };
-  };
-
-  // Serial pagination — Camoufox singleton can't handle concurrent page.goto
-  // (tried chunked-parallel and it produced cascading 90s timeouts).
-  const paginate = async (startPage, bust) => {
-    let page = startPage;
-    while (true) {
-      const hist = await fetchPage(page, bust);
-      if (hist.length === 0) break;
-      const { rows, crossedBoundary } = applyFilter(hist);
-      out.historico.push(...rows);
-      if (crossedBoundary || hist.length < SIZE) break;
-      page += 1;
-    }
-  };
-
-  if (needMore) {
-    await paginate(2, false);
-  }
-
-  // Recovery pass: in full mode the page-1 footer tells us the total available
-  // rows. If we collected fewer (the AALM12-style fault where SPA caching
-  // skips a page), retry pagination from page 2 with fresh cache-bust.
-  if (
-    histFilter === null &&
-    expectedTotal &&
-    out.historico.length < expectedTotal
-  ) {
-    const before = out.historico.length;
-    out.flags.push(
-      `precos_historico: short_paginate (${before} of ${expectedTotal}); retrying`
-    );
-    out.historico = out.historico.slice(0, SIZE); // keep only page 1; redo the rest
-    await paginate(2, true);
-    if (out.historico.length < expectedTotal) {
-      out.flags.push(
-        `precos_historico: incomplete (${out.historico.length} of ${expectedTotal})`
-      );
-    }
-  }
-
-  // Apply final filter to indicativo (always small, single page)
-  if (histFilter !== null) {
-    out.indicativo = out.indicativo.filter((row) => {
-      const dt = parseBrDate(row.data || row.data_de_referencia);
-      return dt && histFilter(dt);
-    });
-    out.historico = out.historico.filter((row) => {
-      const dt = parseBrDate(row.data_de_referencia);
-      return dt && histFilter(dt);
-    });
-  }
-
-  return out;
 }
 
-async function fetchAgenda(ticker) {
-  const out = [];
-  const flags = [];
-  let page = 1;
-  while (true) {
-    const url = `https://data.anbima.com.br/debentures/${ticker}/agenda?page=${page}&size=${SIZE}`;
-    const d = await postExtract(url, 'anbima_debenture_agenda');
-    for (const s of d.suggestions || []) {
-      if (!s.startsWith('Exibindo')) flags.push(s);
-    }
-    const r = d.results[0];
-    const rows = r?.content || [];
-    if (rows.length === 0) break;
-    out.push(...rows);
-    if (rows.length < SIZE) break;
-    page += 1;
+/**
+ * Visit /precos?page=1 — captures /precos summary, /precos/pu-historico
+ * page 0, and the indicative-history graph.
+ */
+async function fetchPrecosFirstPage(ticker) {
+  const xhrs = await scrapeAndCollect(
+    `https://data.anbima.com.br/debentures/${ticker}/precos?page=1&size=${SIZE}`,
+    { waitAfterLoad: 1.5 },
+  );
+  const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return {
+    summary: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/precos$`)),
+    historico: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/precos/pu-historico\\?`)),
+    grafico: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/grafico-pu-historico-indicativo`)),
+  };
+}
+
+/** Visit /precos?page=N — only need the pu-historico XHR. Cache-bust on
+ *  paginations beyond page 1 because the SPA sometimes serves stale state
+ *  when only the page= param changes (observed AALR13 stopping at page=3). */
+async function fetchHistoricoPage(ticker, oneIndexedPage, attempt = 1) {
+  const bust = oneIndexedPage > 1 ? `&_=${Date.now()}-${attempt}` : '';
+  const url = `https://data.anbima.com.br/debentures/${ticker}/precos?page=${oneIndexedPage}&size=${SIZE}${bust}`;
+  const xhrs = await scrapeAndCollect(url, { waitAfterLoad: 1.5 });
+  const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const apiPage = oneIndexedPage - 1;
+  const body = pickXhrBody(
+    xhrs,
+    new RegExp(`/v1/debentures/${tickerEsc}/precos/pu-historico\\?page=${apiPage}\\b`),
+  );
+  // One-shot recovery: re-issue with a fresh cache-bust if no body captured.
+  if (!body && attempt < 2) {
+    return fetchHistoricoPage(ticker, oneIndexedPage, attempt + 1);
   }
-  return { rows: out, flags };
+  return body;
+}
+
+/** Visit /agenda?page=N — only need the agenda XHR. */
+async function fetchAgendaPage(ticker, oneIndexedPage, attempt = 1) {
+  const bust = oneIndexedPage > 1 ? `&_=${Date.now()}-${attempt}` : '';
+  const url = `https://data.anbima.com.br/debentures/${ticker}/agenda?page=${oneIndexedPage}&size=${SIZE}${bust}`;
+  const xhrs = await scrapeAndCollect(url, { waitAfterLoad: 1.5 });
+  const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const apiPage = oneIndexedPage - 1;
+  const body = pickXhrBody(
+    xhrs,
+    new RegExp(`/v1/debentures/${tickerEsc}/agenda\\?page=${apiPage}\\b`),
+  );
+  if (!body && attempt < 2 && oneIndexedPage > 1) {
+    return fetchAgendaPage(ticker, oneIndexedPage, attempt + 1);
+  }
+  return body;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,35 +227,144 @@ async function processTicker(ticker, histFilter) {
   const record = {
     ticker,
     url_base: `https://data.anbima.com.br/debentures/${ticker}`,
+    fetched_at: new Date().toISOString(),
+    info: null,
     caracteristicas: null,
-    precos: null,
-    agenda: null,
+    precos: {
+      summary: null,
+      grafico: null,
+      historico: [],
+      historico_total: null,
+      historico_complete: null,
+    },
+    agenda: {
+      rows: [],
+      total: null,
+      complete: null,
+    },
     errors: [],
+    flags: [],
   };
 
-  // Sequential per-endpoint — Camoufox singleton serializes page.goto calls
-  // anyway. Tried 3-way parallel and it triggered cascading 90s goto
-  // timeouts (browser/page-create contention). Stick to serial.
+  // Step 1: caracteristicas page → info + caracteristicas
   try {
-    record.caracteristicas = await fetchCaracteristicas(ticker);
+    const t = await fetchInfoAndCaracteristicas(ticker);
+    record.info = t.info;
+    record.caracteristicas = t.caracteristicas;
+    if (!t.info && !t.caracteristicas) record.flags.push('info: no_xhr_captured');
   } catch (e) {
-    record.errors.push(`caracteristicas: ${e.message}`);
+    record.errors.push(`info: ${e.message}`);
   }
 
+  // Step 2: precos page 1 → summary + grafico + historico page 0
   try {
-    record.precos = await fetchPrecos(ticker, histFilter);
+    const fp = await fetchPrecosFirstPage(ticker);
+    record.precos.summary = fp.summary;
+    record.precos.grafico = fp.grafico;
+    if (fp.historico) {
+      record.precos.historico_total = fp.historico.total_elements ?? null;
+      record.precos.historico.push(...(fp.historico.content || []));
+    } else {
+      record.flags.push('precos_historico: no_xhr_captured');
+    }
   } catch (e) {
     record.errors.push(`precos: ${e.message}`);
   }
 
-  try {
-    const ag = await fetchAgenda(ticker);
-    record.agenda = { rows: ag.rows, flags: ag.flags };
-  } catch (e) {
-    record.errors.push(`agenda: ${e.message}`);
-  }
+  // Step 3: paginate historico per --historico mode
+  await paginateHistorico(record, ticker, histFilter);
+
+  // Step 4: agenda (always paginate to end; cheap relative to historico)
+  await paginateAgenda(record, ticker);
 
   return record;
+}
+
+async function paginateHistorico(record, ticker, histFilter) {
+  const total = record.precos.historico_total;
+  const haveAll = (count) => total != null && count >= total;
+
+  if (histFilter === null) {
+    // FULL mode: walk to end
+    if (total != null && total > SIZE) {
+      const lastPage = Math.ceil(total / SIZE);
+      for (let p = 2; p <= lastPage; p++) {
+        try {
+          const body = await fetchHistoricoPage(ticker, p);
+          if (!body || !body.content?.length) {
+            record.flags.push(`precos_historico: missing_page=${p}`);
+            break;
+          }
+          record.precos.historico.push(...body.content);
+        } catch (e) {
+          record.errors.push(`precos page ${p}: ${e.message}`);
+          break;
+        }
+      }
+    }
+    record.precos.historico_complete = haveAll(record.precos.historico.length);
+  } else {
+    // D-N or M-1: filter by date window. The API returns rows in DESC date
+    // order, so once a row falls outside the window, all subsequent rows are
+    // also outside.
+    const inWindow = [];
+    for (const row of record.precos.historico) {
+      const d = new Date(row.data_referencia);
+      if (histFilter(d)) inWindow.push(row);
+    }
+    // If page 0 was fully inside the window, paginate forward until a row
+    // crosses the boundary.
+    let needMore = inWindow.length === record.precos.historico.length
+      && record.precos.historico.length === SIZE
+      && (total == null || total > SIZE);
+
+    let page = 2;
+    while (needMore) {
+      try {
+        const body = await fetchHistoricoPage(ticker, page);
+        const rows = body?.content || [];
+        if (rows.length === 0) break;
+        let crossed = false;
+        for (const row of rows) {
+          const d = new Date(row.data_referencia);
+          if (histFilter(d)) inWindow.push(row);
+          else { crossed = true; break; }
+        }
+        if (crossed || rows.length < SIZE) break;
+        page += 1;
+      } catch (e) {
+        record.errors.push(`precos page ${page}: ${e.message}`);
+        break;
+      }
+    }
+
+    record.precos.historico = inWindow;
+    record.precos.historico_complete = true; // by construction (filtered to window)
+  }
+}
+
+async function paginateAgenda(record, ticker) {
+  let p = 1;
+  while (true) {
+    try {
+      const body = await fetchAgendaPage(ticker, p);
+      if (!body) {
+        if (p === 1) record.flags.push('agenda: no_xhr_captured');
+        break;
+      }
+      if (p === 1) record.agenda.total = body.total_elements ?? null;
+      const rows = body.content || [];
+      record.agenda.rows.push(...rows);
+      if (rows.length < SIZE) break;
+      p += 1;
+    } catch (e) {
+      record.errors.push(`agenda page ${p}: ${e.message}`);
+      break;
+    }
+  }
+  record.agenda.complete = record.agenda.total != null
+    ? record.agenda.rows.length >= record.agenda.total
+    : record.agenda.rows.length > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,11 +377,8 @@ function ensureDir(path) {
 
 function loadOutput(path) {
   if (!existsSync(path)) return [];
-  try {
-    return JSON.parse(readFileSync(path, 'utf8'));
-  } catch {
-    return [];
-  }
+  try { return JSON.parse(readFileSync(path, 'utf8')); }
+  catch { return []; }
 }
 
 function saveOutput(path, records) {
@@ -342,9 +390,6 @@ async function main() {
   const histFilter = buildHistFilter(HIST);
 
   const listing = JSON.parse(readFileSync(INPUT, 'utf8'));
-  // Parse ticker from the URL path — title can carry concatenated badges
-  // like "ABFR12Lei 12.431" that the listing's split-on-whitespace heuristic
-  // fails to strip (when the badge has no leading space).
   const tickerFromUrl = (url) => {
     const m = /\/debentures\/([^/?]+)/i.exec(url || '');
     return m ? m[1].toUpperCase() : null;
@@ -354,6 +399,7 @@ async function main() {
   console.log(`Loaded ${tickers.length} tickers from ${INPUT}`);
   console.log(`Mode: --historico ${HIST} (filter=${histFilter ? 'yes' : 'no'})`);
   console.log(`Output: ${OUTPUT} (resume=${RESUME})`);
+  console.log(`Scraper: ${SCRAPER} | delay=${DELAY}ms retry=${RETRY} timeout=${TIMEOUT}ms`);
 
   let existing = RESUME ? loadOutput(OUTPUT) : [];
   const seen = new Set(existing.map((r) => r.ticker));
@@ -362,15 +408,10 @@ async function main() {
   console.log(`Processing ${slice.length} tickers (start=${START}, limit=${LIMIT === Infinity ? 'all' : LIMIT})`);
 
   const t0 = Date.now();
-  let done = 0;
-  let skipped = 0;
-  let failed = 0;
+  let done = 0, skipped = 0, failed = 0;
 
   for (const ticker of slice) {
-    if (seen.has(ticker)) {
-      skipped += 1;
-      continue;
-    }
+    if (seen.has(ticker)) { skipped += 1; continue; }
 
     const ts = Date.now();
     let record;
@@ -385,28 +426,28 @@ async function main() {
     saveOutput(OUTPUT, existing);
     done += 1;
 
-    const elapsed = ((Date.now() - ts) / 1000).toFixed(2);
+    const el = ((Date.now() - ts) / 1000).toFixed(2);
     const total = ((Date.now() - t0) / 1000).toFixed(1);
-    const errCount = record.errors?.length ?? 0;
-    const cFields  = record.caracteristicas ? Object.keys(record.caracteristicas).length : 0;
-    const pInd     = record.precos?.indicativo?.length ?? 0;
-    const pHist    = record.precos?.historico?.length ?? 0;
-    const aRows    = record.agenda?.rows?.length ?? 0;
+    const errs = record.errors?.length ?? 0;
+    const histLen = record.precos?.historico?.length ?? 0;
+    const histTot = record.precos?.historico_total ?? '?';
+    const agLen = record.agenda?.rows?.length ?? 0;
+    const agTot = record.agenda?.total ?? '?';
+    const cFields = (record.caracteristicas ? Object.keys(record.caracteristicas).length : 0);
     if (!QUIET) {
       console.log(
-        `  [${done}/${slice.length}] ${ticker} ${elapsed}s | c=${cFields} p=${pInd}+${pHist} a=${aRows}` +
-        (errCount ? ` | errors=${errCount}` : '') +
+        `  [${done}/${slice.length}] ${ticker} ${el}s | c=${cFields} h=${histLen}/${histTot} a=${agLen}/${agTot}` +
+        (errs ? ` | errors=${errs}` : '') +
         ` | total=${total}s`,
       );
     }
-
     if (DELAY > 0) await sleep(DELAY);
   }
 
-  const elapsedTotal = ((Date.now() - t0) / 1000).toFixed(1);
+  const total = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(``);
-  console.log(`Done. ${done} processed, ${skipped} skipped, ${failed} fatal in ${elapsedTotal}s`);
-  console.log(`Average: ${(elapsedTotal / Math.max(done, 1)).toFixed(2)}s/ticker`);
+  console.log(`Done. ${done} processed, ${skipped} skipped, ${failed} fatal in ${total}s`);
+  console.log(`Average: ${(total / Math.max(done, 1)).toFixed(2)}s/ticker`);
   console.log(`Saved to ${OUTPUT}`);
 }
 
