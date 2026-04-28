@@ -34,9 +34,15 @@ import { normalizeKey, tickerFromUrl, cleanText } from './anbima_utils.js';
 const anbimaDebentureCaracteristicas: Profile = {
   name: 'anbima_debenture_caracteristicas',
   captchaPatterns: [],
-  // The body section renders last; wait for one of its containers.
+  // ANBIMA renders <div class="skeleton-container"> placeholders in every
+  // label/value cell until the data XHR resolves. Wait for the entire batch
+  // to hydrate — partial hydration silently produces empty fields.
   waitForSelector: '.anbima-ui-output__container',
-  waitAfterLoad: 3,
+  // Expression form (no arrow): Playwright Python evaluates the string as-is.
+  // Wait for data containers to exist AND every skeleton placeholder gone.
+  waitForFunction:
+    'document.querySelectorAll(".anbima-ui-output__container").length >= 5 && document.querySelectorAll(".skeleton-container").length === 0',
+  waitAfterLoad: 0,
 
   extract(html: string, url: string): ExtractionOutput {
     const $ = cheerio.load(html);

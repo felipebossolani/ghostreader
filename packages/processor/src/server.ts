@@ -203,6 +203,7 @@ app.post('/extract', async (c) => {
       waitAfterLoad: body.wait_after_load ?? profile.waitAfterLoad,
       timeout: body.timeout ?? 30000,
       waitForSelector: profile.waitForSelector,
+      waitForFunction: profile.waitForFunction,
     });
 
     // Check if we got a CAPTCHA

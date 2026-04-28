@@ -396,7 +396,8 @@ def _log_config(config):
 # ---------------------------------------------------------------------------
 
 async def render_page(url, wait_after_load=2.0, timeout=15000, headers=None,
-                       wait_for_selector=None, wait_until="domcontentloaded"):
+                       wait_for_selector=None, wait_until="domcontentloaded",
+                       wait_for_function=None):
     """Render a page in the browser and return (html, status_code, final_url).
 
     This is the shared rendering logic used by both /scrape and /extract.
@@ -418,6 +419,21 @@ async def render_page(url, wait_after_load=2.0, timeout=15000, headers=None,
                 )
             except Exception:
                 logger.warning("Selector %s not found, continuing...", wait_for_selector)
+
+        if wait_for_function:
+            # Wait for a custom JS predicate to become true. Useful for SPA
+            # apps that hydrate cells progressively (e.g. ANBIMA Data, where
+            # `document.querySelectorAll(".skeleton-container").length === 0`
+            # marks the end of XHR-driven row population).
+            logger.info("wait_for_function: %r", wait_for_function[:80])
+            try:
+                await page.wait_for_function(
+                    wait_for_function,
+                    timeout=min(timeout, 10000),
+                )
+                logger.info("wait_for_function: resolved")
+            except Exception as e:
+                logger.warning("wait_for_function failed: %s", e)
 
         if wait_after_load > 0:
             await page.wait_for_timeout(int(wait_after_load * 1000))
@@ -460,6 +476,7 @@ async def handle_scrape(request: web.Request) -> web.Response:
             headers=body.get("headers"),
             wait_for_selector=body.get("wait_for_selector"),
             wait_until=body.get("wait_until", "domcontentloaded"),
+            wait_for_function=body.get("wait_for_function"),
         )
 
         logger.info("Scraped %s -> %d (%d bytes)", url, status_code, len(page_html))

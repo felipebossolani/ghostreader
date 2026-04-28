@@ -21,10 +21,12 @@ import { tickerFromUrl, tableToRows, cleanText } from './anbima_utils.js';
 const anbimaDebentureAgenda: Profile = {
   name: 'anbima_debenture_agenda',
   captchaPatterns: [],
-  // Wait on a generic card marker — the page may legitimately render a
-  // not-found template with no <table> at all.
-  waitForSelector: '.anbima-ui-card, .anbima-ui-not-found-page',
-  waitAfterLoad: 3,
+  // Wait for either the event table to fully hydrate (zero skeletons) or
+  // for the not-found template (LTTE14-style) to appear instead.
+  waitForSelector: 'tbody tr, .anbima-ui-not-found-page',
+  waitForFunction:
+    '(document.querySelector(".anbima-ui-not-found-page") !== null) || (document.querySelectorAll("tbody tr").length > 0 && document.querySelectorAll(".skeleton-container").length === 0)',
+  waitAfterLoad: 0,
 
   extract(html: string, url: string): ExtractionOutput {
     const $ = cheerio.load(html);

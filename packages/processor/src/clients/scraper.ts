@@ -14,6 +14,12 @@ export interface ScrapeOptions {
   headers?: Record<string, string>;
   waitForSelector?: string;
   waitUntil?: string;
+  /**
+   * JS expression evaluated in the page context. The scraper waits until it
+   * returns a truthy value before snapshotting HTML. Use for SPAs that
+   * hydrate progressively where a CSS selector match is too coarse.
+   */
+  waitForFunction?: string;
 }
 
 export interface ScrapeResult {
@@ -36,6 +42,7 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeResult> {
       headers: options.headers,
       wait_for_selector: options.waitForSelector,
       wait_until: options.waitUntil ?? 'load',
+      wait_for_function: options.waitForFunction,
     }),
   });
 

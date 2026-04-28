@@ -7,7 +7,7 @@
  *
  * Options:
  *   --pages <n>        Number of pages to fetch (default: 10)
- *   --size  <n>        Items per page — must match ANBIMA's page size (default: 20)
+ *   --size  <n>        Items per page (default: 100; ANBIMA accepts up to 100)
  *   --output <path>    Output file path (default: debentures.json)
  *   --base-url <url>   GhostReader processor URL (default: http://localhost:3000)
  *   --delay <ms>       Delay between requests in ms to be polite (default: 2000)
@@ -46,7 +46,7 @@ function parseArgs(args) {
 const flags = parseArgs(process.argv.slice(2));
 
 const PAGES    = parseInt(flags.pages   || '10', 10);
-const SIZE     = parseInt(flags.size    || '20', 10);
+const SIZE     = parseInt(flags.size    || '100', 10);
 const OUTPUT   = flags.output           || 'debentures.json';
 const BASE_URL = (process.env.GHOSTREADER_URL || flags['base-url'] || 'http://localhost:3000').replace(/\/$/, '');
 const DELAY    = parseInt(flags.delay   || '2000', 10);

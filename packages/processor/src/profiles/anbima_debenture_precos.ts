@@ -30,20 +30,23 @@ type TableKind = 'indicativo' | 'historico' | null;
 
 function classifyByHeaders(headers: string[]): TableKind {
   const set = new Set(headers);
-  if (set.has('data_de_referencia')) return 'historico';
-  if (set.has('data') && (set.has('taxa_indicativa') || set.has('pu_indicativo'))) {
-    return 'indicativo';
-  }
+  // Indicativo signals (works for both ANBIMA layouts: the legacy 12-col
+  // schema with `data` and the compact 6-col schema with `data_de_referencia`).
+  if (set.has('pu_indicativo') || set.has('taxa_indicativa')) return 'indicativo';
+  // Histórico is the only table with PU PAR or VNA columns.
+  if (set.has('vna') || set.has('pu_par')) return 'historico';
   return null;
 }
 
 const anbimaDebenturePrecos: Profile = {
   name: 'anbima_debenture_precos',
   captchaPatterns: [],
-  // Page may legitimately have no <table> when asset is not priced — wait on
-  // a generic content marker instead so we don't time out on those.
-  waitForSelector: '.anbima-ui-card',
-  waitAfterLoad: 3,
+  // Wait for ALL skeletons to disappear — pricing tables hydrate row-by-row,
+  // so matching the first hydrated row truncates output to a few entries.
+  waitForSelector: 'tbody tr',
+  waitForFunction:
+    'document.querySelectorAll("tbody tr").length > 0 && document.querySelectorAll(".skeleton-container").length === 0',
+  waitAfterLoad: 0,
 
   extract(html: string, url: string): ExtractionOutput {
     const $ = cheerio.load(html);

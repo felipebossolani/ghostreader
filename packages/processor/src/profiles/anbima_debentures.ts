@@ -30,7 +30,7 @@ const anbimaDebentures: Profile = {
   name: 'anbima_debentures',
   captchaPatterns: [],
   waitForSelector: 'li.list-item__container',
-  waitAfterLoad: 3,
+  waitAfterLoad: 0,
 
   extract(html: string, _url: string): ExtractionOutput {
     const results: ExtractionOutput['results'] = [];
