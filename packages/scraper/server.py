@@ -427,9 +427,13 @@ async def render_page(url, wait_after_load=2.0, timeout=15000, headers=None,
             # marks the end of XHR-driven row population).
             logger.info("wait_for_function: %r", wait_for_function[:80])
             try:
+                # 12s cap balances slow-XHR tolerance against tail latency.
+                # Empty/out-of-range pages will hit this and continue with
+                # whatever DOM state is available (which is correct behavior
+                # for end-of-pagination detection).
                 await page.wait_for_function(
                     wait_for_function,
-                    timeout=min(timeout, 10000),
+                    timeout=min(timeout, 12000),
                 )
                 logger.info("wait_for_function: resolved")
             except Exception as e:

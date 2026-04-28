@@ -41,7 +41,11 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeResult> {
       timeout: options.timeout ?? 60000,
       headers: options.headers,
       wait_for_selector: options.waitForSelector,
-      wait_until: options.waitUntil ?? 'load',
+      // 'domcontentloaded' fires earlier than 'load' (skips waiting for
+      // images/fonts/analytics) — wait_for_function below is the actual
+      // gate on data presence, so the lighter wait_until is safe and
+      // shaves seconds off every call.
+      wait_until: options.waitUntil ?? 'domcontentloaded',
       wait_for_function: options.waitForFunction,
     }),
   });

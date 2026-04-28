@@ -136,11 +136,27 @@ async function fetchCaracteristicas(ticker) {
   return data.results[0]?.content || {};
 }
 
+/** Build a precos URL. With `bust=true`, append a cache-bust param to
+ *  force a cold navigation (used only on recovery passes; defeats the
+ *  Camoufox/SPA optimisation that keeps subsequent calls fast). */
+function precosUrl(ticker, page, bust = false) {
+  const u = `https://data.anbima.com.br/debentures/${ticker}/precos?page=${page}&size=${SIZE}`;
+  return bust ? `${u}&_=${Date.now()}` : u;
+}
+
+/** Parse "Exibindo 1 - 100 de 386 resultados" → 386. Returns null on miss. */
+function parseExpectedTotal(suggestions) {
+  for (const s of suggestions || []) {
+    const m = /Exibindo\s+\d+\s*-\s*\d+\s+de\s+(\d+)\s+resultados/i.exec(s);
+    if (m) return parseInt(m[1], 10);
+  }
+  return null;
+}
+
 async function fetchPrecos(ticker, histFilter) {
   // Always pull page 1 first — covers most assets in one shot under D-30.
   const out = { indicativo: [], historico: [], flags: [] };
-  const url1 = `https://data.anbima.com.br/debentures/${ticker}/precos?page=1&size=${SIZE}`;
-  const d1 = await postExtract(url1, 'anbima_debenture_precos');
+  const d1 = await postExtract(precosUrl(ticker, 1, false), 'anbima_debenture_precos');
 
   for (const r of d1.results) {
     if (r.title.endsWith('PU Indicativo')) out.indicativo = r.content;
@@ -149,6 +165,8 @@ async function fetchPrecos(ticker, histFilter) {
   for (const s of d1.suggestions || []) {
     if (!s.startsWith('Exibindo')) out.flags.push(s);
   }
+
+  const expectedTotal = parseExpectedTotal(d1.suggestions);
 
   // Should we paginate Histórico? Need full mode OR D-N where N exceeds first page coverage.
   let needMore = false;
@@ -162,34 +180,66 @@ async function fetchPrecos(ticker, histFilter) {
     needMore = oldestDate && histFilter(oldestDate);
   }
 
-  if (needMore) {
-    let page = 2;
-    while (true) {
-      const url = `https://data.anbima.com.br/debentures/${ticker}/precos?page=${page}&size=${SIZE}`;
-      const d = await postExtract(url, 'anbima_debenture_precos');
-      const hist = d.results.find((r) => r.title.endsWith('PU Histórico'))?.content || [];
-      if (hist.length === 0) break;
+  // Fetch one page's historico rows. Returns null on no-data signal.
+  const fetchPage = async (page, bust) => {
+    const d = await postExtract(precosUrl(ticker, page, bust), 'anbima_debenture_precos');
+    const hist = d.results.find((r) => r.title.endsWith('PU Histórico'))?.content || [];
+    return hist;
+  };
 
-      // Filter by window. If first row is already older than window, we're done.
-      let stop = false;
-      if (histFilter !== null) {
-        const filtered = [];
-        for (const row of hist) {
-          const dt = parseBrDate(row.data_de_referencia);
-          if (dt && histFilter(dt)) filtered.push(row);
-          else if (dt && dt < (new Date(Date.now() - 365 * 86400_000))) {
-            // hard stop if we've gone more than a year past today
-            stop = true; break;
-          }
-        }
-        out.historico.push(...filtered);
-        if (filtered.length < hist.length) stop = true; // crossed window boundary
-      } else {
-        out.historico.push(...hist);
+  // Apply window filter to a page's rows. Returns {rows, crossedBoundary}.
+  const applyFilter = (hist) => {
+    if (histFilter === null) return { rows: hist, crossedBoundary: false };
+    const filtered = [];
+    let crossed = false;
+    for (const row of hist) {
+      const dt = parseBrDate(row.data_de_referencia);
+      if (dt && histFilter(dt)) filtered.push(row);
+      else if (dt && dt < new Date(Date.now() - 365 * 86400_000)) {
+        crossed = true;
+        break;
       }
+    }
+    if (filtered.length < hist.length) crossed = true;
+    return { rows: filtered, crossedBoundary: crossed };
+  };
 
-      if (stop || hist.length < SIZE) break;
+  // Serial pagination — Camoufox singleton can't handle concurrent page.goto
+  // (tried chunked-parallel and it produced cascading 90s timeouts).
+  const paginate = async (startPage, bust) => {
+    let page = startPage;
+    while (true) {
+      const hist = await fetchPage(page, bust);
+      if (hist.length === 0) break;
+      const { rows, crossedBoundary } = applyFilter(hist);
+      out.historico.push(...rows);
+      if (crossedBoundary || hist.length < SIZE) break;
       page += 1;
+    }
+  };
+
+  if (needMore) {
+    await paginate(2, false);
+  }
+
+  // Recovery pass: in full mode the page-1 footer tells us the total available
+  // rows. If we collected fewer (the AALM12-style fault where SPA caching
+  // skips a page), retry pagination from page 2 with fresh cache-bust.
+  if (
+    histFilter === null &&
+    expectedTotal &&
+    out.historico.length < expectedTotal
+  ) {
+    const before = out.historico.length;
+    out.flags.push(
+      `precos_historico: short_paginate (${before} of ${expectedTotal}); retrying`
+    );
+    out.historico = out.historico.slice(0, SIZE); // keep only page 1; redo the rest
+    await paginate(2, true);
+    if (out.historico.length < expectedTotal) {
+      out.flags.push(
+        `precos_historico: incomplete (${out.historico.length} of ${expectedTotal})`
+      );
     }
   }
 
@@ -241,6 +291,9 @@ async function processTicker(ticker, histFilter) {
     errors: [],
   };
 
+  // Sequential per-endpoint — Camoufox singleton serializes page.goto calls
+  // anyway. Tried 3-way parallel and it triggered cascading 90s goto
+  // timeouts (browser/page-create contention). Stick to serial.
   try {
     record.caracteristicas = await fetchCaracteristicas(ticker);
   } catch (e) {
