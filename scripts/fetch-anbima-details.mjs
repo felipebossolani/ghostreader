@@ -289,9 +289,14 @@ async function main() {
   const histFilter = buildHistFilter(HIST);
 
   const listing = JSON.parse(readFileSync(INPUT, 'utf8'));
-  const tickers = listing
-    .map((entry) => entry.title?.split(/\s/)[0] || null)
-    .filter(Boolean);
+  // Parse ticker from the URL path — title can carry concatenated badges
+  // like "ABFR12Lei 12.431" that the listing's split-on-whitespace heuristic
+  // fails to strip (when the badge has no leading space).
+  const tickerFromUrl = (url) => {
+    const m = /\/debentures\/([^/?]+)/i.exec(url || '');
+    return m ? m[1].toUpperCase() : null;
+  };
+  const tickers = listing.map((entry) => tickerFromUrl(entry.url)).filter(Boolean);
 
   console.log(`Loaded ${tickers.length} tickers from ${INPUT}`);
   console.log(`Mode: --historico ${HIST} (filter=${histFilter ? 'yes' : 'no'})`);
