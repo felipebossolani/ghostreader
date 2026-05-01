@@ -22,3 +22,6 @@ debentures.json
 
 # OS
 .DS_Store
+
+# ANBIMA scraping outputs
+data/anbima/

@@ -32,6 +32,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -66,6 +67,21 @@ const LIMIT   = flags.limit ? parseInt(flags.limit, 10) : Infinity;
 const START   = flags.start ? parseInt(flags.start, 10) : 0;
 const QUIET   = flags.quiet === 'true';
 const SIZE    = 100;
+// Hard cap on historico rows per ticker in full mode. Papers like the
+// BFBL family carry 4800+ daily PU rows = 48 pages = ~9 min/ticker on a
+// healthy Camoufox. Capping at the most-recent N rows keeps the long-tail
+// from blowing the run wall-clock without losing data anyone actually
+// uses (4 years of business days ≈ 1000 rows). 0 disables the cap.
+const HISTORICO_CAP = parseInt(flags['historico-cap'] || '1000', 10);
+// Restart the Camoufox container after this many tickers to head off the
+// "BrowserContext closed" failure that surfaces under sustained load (~100
+// tickers in observed). Set to 0 to disable.
+const RESTART_EVERY = parseInt(flags['restart-every'] || '80', 10);
+// docker compose restart can leave the container in a zombie state when
+// Camoufox child processes hang. Force-recreate via kill+rm+up to ensure
+// a clean Playwright/browser state.
+const RESTART_CMD   = flags['restart-cmd']
+  || 'docker rm -f ghostreader-scraper-1 2>/dev/null; docker compose up -d scraper';
 
 // ---------------------------------------------------------------------------
 // History window predicate (operates on JS Date — XHR data is ISO)
@@ -150,53 +166,78 @@ function pickXhrBody(xhrs, urlPattern) {
 // Per-endpoint helpers (operate on captured XHRs)
 // ---------------------------------------------------------------------------
 
+// Skeleton-aware predicates: snapshot only after ANBIMA's data XHR has
+// landed AND the SPA replaced its skeleton placeholders with real content.
+// These are the strongest signal that the XHR was actually captured.
+const PREDICATE_CARACTERISTICAS =
+  'document.querySelectorAll(".anbima-ui-output__container").length >= 5 && document.querySelectorAll(".skeleton-container").length === 0';
+const PREDICATE_PRECOS =
+  'document.querySelectorAll("tbody tr").length > 0 && document.querySelectorAll(".skeleton-container").length === 0';
+const PREDICATE_AGENDA =
+  '(document.querySelector(".anbima-ui-not-found-page") !== null) || (document.querySelectorAll("tbody tr").length > 0 && document.querySelectorAll(".skeleton-container").length === 0)';
+
 /**
  * Visit /caracteristicas — captures /v1/debentures/{T} (info geral) and
- * /v1/debentures/{T}/caracteristicas (rich info).
+ * /v1/debentures/{T}/caracteristicas (rich info). Retries once with
+ * cache-bust if neither XHR landed (transient SPA/Camoufox state).
  */
-async function fetchInfoAndCaracteristicas(ticker) {
+async function fetchInfoAndCaracteristicas(ticker, attempt = 1) {
+  const bust = attempt > 1 ? `?_=${Date.now()}-${attempt}` : '';
   const xhrs = await scrapeAndCollect(
-    `https://data.anbima.com.br/debentures/${ticker}/caracteristicas`,
-    { waitAfterLoad: 1.5 },
+    `https://data.anbima.com.br/debentures/${ticker}/caracteristicas${bust}`,
+    { waitAfterLoad: 0, waitForFunction: PREDICATE_CARACTERISTICAS },
   );
   const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return {
+  const result = {
     info: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}$`)),
     caracteristicas: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/caracteristicas$`)),
   };
+  if (!result.info && !result.caracteristicas && attempt < 2) {
+    return fetchInfoAndCaracteristicas(ticker, attempt + 1);
+  }
+  return result;
 }
 
 /**
  * Visit /precos?page=1 — captures /precos summary, /precos/pu-historico
- * page 0, and the indicative-history graph.
+ * page 0, and the indicative-history graph. Retries once with cache-bust
+ * if the historico XHR is missing (essential for downstream pagination).
  */
-async function fetchPrecosFirstPage(ticker) {
+async function fetchPrecosFirstPage(ticker, attempt = 1) {
+  const bust = attempt > 1 ? `&_=${Date.now()}-${attempt}` : '';
   const xhrs = await scrapeAndCollect(
-    `https://data.anbima.com.br/debentures/${ticker}/precos?page=1&size=${SIZE}`,
-    { waitAfterLoad: 1.5 },
+    `https://data.anbima.com.br/debentures/${ticker}/precos?page=1&size=${SIZE}${bust}`,
+    { waitAfterLoad: 0, waitForFunction: PREDICATE_PRECOS },
   );
   const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return {
+  const result = {
     summary: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/precos$`)),
     historico: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/precos/pu-historico\\?`)),
     grafico: pickXhrBody(xhrs, new RegExp(`/v1/debentures/${tickerEsc}/grafico-pu-historico-indicativo`)),
   };
+  // historico is the load-bearing one; if it's missing, the rest is moot.
+  if (!result.historico && attempt < 2) {
+    return fetchPrecosFirstPage(ticker, attempt + 1);
+  }
+  return result;
 }
 
 /** Visit /precos?page=N — only need the pu-historico XHR. Cache-bust on
- *  paginations beyond page 1 because the SPA sometimes serves stale state
- *  when only the page= param changes (observed AALR13 stopping at page=3). */
+ *  every >page=1 fetch because the SPA serves stale state when only the
+ *  page= param changes (observed AALR13 stopping at page=3). */
 async function fetchHistoricoPage(ticker, oneIndexedPage, attempt = 1) {
-  const bust = oneIndexedPage > 1 ? `&_=${Date.now()}-${attempt}` : '';
+  const bust = `&_=${Date.now()}-${attempt}`;
   const url = `https://data.anbima.com.br/debentures/${ticker}/precos?page=${oneIndexedPage}&size=${SIZE}${bust}`;
-  const xhrs = await scrapeAndCollect(url, { waitAfterLoad: 1.5 });
+  const xhrs = await scrapeAndCollect(url, {
+    waitAfterLoad: 0,
+    waitForFunction: PREDICATE_PRECOS,
+  });
   const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const apiPage = oneIndexedPage - 1;
   const body = pickXhrBody(
     xhrs,
     new RegExp(`/v1/debentures/${tickerEsc}/precos/pu-historico\\?page=${apiPage}\\b`),
   );
-  // One-shot recovery: re-issue with a fresh cache-bust if no body captured.
   if (!body && attempt < 2) {
     return fetchHistoricoPage(ticker, oneIndexedPage, attempt + 1);
   }
@@ -205,16 +246,19 @@ async function fetchHistoricoPage(ticker, oneIndexedPage, attempt = 1) {
 
 /** Visit /agenda?page=N — only need the agenda XHR. */
 async function fetchAgendaPage(ticker, oneIndexedPage, attempt = 1) {
-  const bust = oneIndexedPage > 1 ? `&_=${Date.now()}-${attempt}` : '';
+  const bust = oneIndexedPage > 1 || attempt > 1 ? `&_=${Date.now()}-${attempt}` : '';
   const url = `https://data.anbima.com.br/debentures/${ticker}/agenda?page=${oneIndexedPage}&size=${SIZE}${bust}`;
-  const xhrs = await scrapeAndCollect(url, { waitAfterLoad: 1.5 });
+  const xhrs = await scrapeAndCollect(url, {
+    waitAfterLoad: 0,
+    waitForFunction: PREDICATE_AGENDA,
+  });
   const tickerEsc = ticker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const apiPage = oneIndexedPage - 1;
   const body = pickXhrBody(
     xhrs,
     new RegExp(`/v1/debentures/${tickerEsc}/agenda\\?page=${apiPage}\\b`),
   );
-  if (!body && attempt < 2 && oneIndexedPage > 1) {
+  if (!body && attempt < 2) {
     return fetchAgendaPage(ticker, oneIndexedPage, attempt + 1);
   }
   return body;
@@ -285,9 +329,15 @@ async function paginateHistorico(record, ticker, histFilter) {
   const haveAll = (count) => total != null && count >= total;
 
   if (histFilter === null) {
-    // FULL mode: walk to end
-    if (total != null && total > SIZE) {
-      const lastPage = Math.ceil(total / SIZE);
+    // FULL mode: walk to end (or to the configured cap, whichever is smaller).
+    // The cap protects against long-tail papers (e.g. BFBL family with 4800+
+    // rows) that would otherwise dominate run time. Rows are returned in
+    // DESC date order, so the cap keeps the most recent N.
+    const effectiveTarget = HISTORICO_CAP > 0 && total != null
+      ? Math.min(total, HISTORICO_CAP)
+      : total;
+    if (effectiveTarget != null && effectiveTarget > SIZE) {
+      const lastPage = Math.ceil(effectiveTarget / SIZE);
       for (let p = 2; p <= lastPage; p++) {
         try {
           const body = await fetchHistoricoPage(ticker, p);
@@ -302,7 +352,15 @@ async function paginateHistorico(record, ticker, histFilter) {
         }
       }
     }
+    // Trim to cap if we overshot (last page may have brought us past N).
+    if (HISTORICO_CAP > 0 && record.precos.historico.length > HISTORICO_CAP) {
+      record.precos.historico = record.precos.historico.slice(0, HISTORICO_CAP);
+    }
     record.precos.historico_complete = haveAll(record.precos.historico.length);
+    if (HISTORICO_CAP > 0 && total != null && total > HISTORICO_CAP) {
+      record.precos.historico_capped = true;
+      record.flags.push(`precos_historico: capped at ${HISTORICO_CAP} of ${total}`);
+    }
   } else {
     // D-N or M-1: filter by date window. The API returns rows in DESC date
     // order, so once a row falls outside the window, all subsequent rows are
@@ -386,6 +444,30 @@ function saveOutput(path, records) {
   writeFileSync(path, JSON.stringify(records, null, 2), 'utf8');
 }
 
+async function restartScraper() {
+  console.log(`  -> restarting scraper: ${RESTART_CMD}`);
+  try {
+    execFileSync('sh', ['-c', RESTART_CMD], { stdio: 'inherit', timeout: 180000 });
+  } catch (e) {
+    console.error(`  -> restart cmd error: ${e.message}`);
+  }
+  // Wait for /health to come back
+  const start = Date.now();
+  while (Date.now() - start < 120000) {
+    try {
+      const r = await fetch(`${SCRAPER}/health`);
+      if (r.ok) {
+        console.log(`  -> scraper back after ${((Date.now() - start) / 1000).toFixed(1)}s`);
+        return;
+      }
+    } catch {
+      // not yet
+    }
+    await sleep(2000);
+  }
+  console.error('  -> scraper did not come back within 120s; continuing anyway');
+}
+
 async function main() {
   const histFilter = buildHistFilter(HIST);
 
@@ -409,6 +491,10 @@ async function main() {
 
   const t0 = Date.now();
   let done = 0, skipped = 0, failed = 0;
+  // Camoufox sometimes dies mid-run while still answering /health. Detect
+  // it via a streak of failed tickers and force-restart immediately.
+  const MAX_CONSEC_ERRS = 3;
+  let consecutiveErrs = 0;
 
   for (const ticker of slice) {
     if (seen.has(ticker)) { skipped += 1; continue; }
@@ -441,7 +527,24 @@ async function main() {
         ` | total=${total}s`,
       );
     }
+    // Track consecutive errors and trigger emergency restart.
+    if ((record.errors?.length ?? 0) > 0) {
+      consecutiveErrs += 1;
+      if (consecutiveErrs >= MAX_CONSEC_ERRS) {
+        console.log(`  -> ${consecutiveErrs} consecutive failed tickers, emergency restart`);
+        await restartScraper();
+        consecutiveErrs = 0;
+      }
+    } else {
+      consecutiveErrs = 0;
+    }
+
     if (DELAY > 0) await sleep(DELAY);
+
+    // Periodic scraper restart to evict stale Camoufox context
+    if (RESTART_EVERY > 0 && done % RESTART_EVERY === 0) {
+      await restartScraper();
+    }
   }
 
   const total = ((Date.now() - t0) / 1000).toFixed(1);
